@@ -363,7 +363,195 @@ def make_training_step(
         )
 
         # 5. Update networks after warmup
+        key, key_updates = jax.random.split(key)
+
+        should_update = (state.step >= warmup_steps) & (
+            new_replay_buf.size >= batch_size
+        )
+
+        update_inputs = (
+            state.policy_state,
+            state.critic_state,
+            state.disc_state,
+            state.target_critic_params,
+            new_replay_buf,
+            key_updates,
+        )
+
+        def skip_updates(inputs):
+            policy_state, critic_state, disc_state, target_params, _, _ = inputs
+            return policy_state, critic_state, disc_state, target_params, 0.0, 0.0, 0.0
+
+        def do_updates(inputs):
+            # Perform multiple gradient updates (UTD ratio)
+            (
+                policy_state,
+                critic_state,
+                disc_state,
+                target_params,
+                replay_buf,
+                update_key,
+            ) = inputs
+
+            def single_update(carry, _):
+                policy_state, critic_state, disc_state, target_params, key = carry
+                key, key_sample, key_critic, key_actor, key_disc = jax.random.split(
+                    key, 5
+                )
+
+                batch = buffer_sample(replay_buf, key_sample, batch_size)
+                (
+                    batch_obs,
+                    batch_act,
+                    batch_rew,
+                    batch_next,
+                    batch_done,
+                    batch_skill,
+                    batch_ep_step,
+                ) = batch
+
+                batch_obs = jnp.nan_to_num(batch_obs, nan=0.0)
+                batch_act = jnp.nan_to_num(batch_act, nan=0.0)
+                batch_rew = jnp.nan_to_num(batch_rew, nan=0.0)
+                batch_next = jnp.nan_to_num(batch_next, nan=0.0)
+
+                batch_skill_onehot = jax.nn.one_hot(batch_skill, n_skills)
+
+                critic_state, c_loss = do_update_critic(
+                    critic_state,
+                    target_params,
+                    policy_state,
+                    batch_obs,
+                    batch_act,
+                    batch_rew,
+                    batch_next,
+                    batch_done,
+                    batch_skill_onehot,
+                    key=key_critic,
+                )
+
+                policy_state, a_loss = do_update_actor(
+                    policy_state,
+                    critic_state,
+                    batch_obs,
+                    batch_skill_onehot,
+                    key=key_actor,
+                )
+
+                def disc_update_step(disc_carry, _):
+                    disc_state, d_key = disc_carry
+                    d_key, d_sample_key = jax.random.split(d_key)
+                    d_batch = buffer_sample(replay_buf, d_sample_key, batch_size)
+                    d_next = jnp.nan_to_num(d_batch[3], nan=0.0)
+                    d_done = d_batch[4]
+                    d_skill = d_batch[5]
+                    d_ep_step = d_batch[6]
+                    non_terminal_mask = 1.0 - d_done
+                    disc_state, d_loss = do_update_disc(
+                        disc_state,
+                        d_next,
+                        d_skill,
+                        mask=non_terminal_mask,
+                        episode_step=d_ep_step,
+                    )
+                    return (disc_state, d_key), d_loss
+
+                # Update disc_utd_ratio number of times
+                (disc_state, _), d_losses = jax.lax.scan(
+                    disc_update_step,
+                    (disc_state, key_disc),
+                    None,
+                    length=disc_utd_ratio,
+                )
+                d_loss = jnp.mean(d_losses)
+
+                target_params = do_soft_update(target_params, critic_state.params)
+
+                return (policy_state, critic_state, disc_state, target_params, key), (
+                    c_loss,
+                    a_loss,
+                    d_loss,
+                )
+
+            # Update utd_ratio number of times
+            init_carry = (
+                policy_state,
+                critic_state,
+                disc_state,
+                target_params,
+                update_key,
+            )
+            (policy_state, critic_state, disc_state, target_params, _), losses = (
+                jax.lax.scan(single_update, init_carry, None, length=utd_ratio)
+            )
+
+            c_loss, a_loss, d_loss = (
+                jnp.mean(losses[0]),
+                jnp.mean(losses[1]),
+                jnp.mean(losses[2]),
+            )
+            return (
+                policy_state,
+                critic_state,
+                disc_state,
+                target_params,
+                c_loss,
+                a_loss,
+                d_loss,
+            )
+
+        (
+            policy_state,
+            critic_state,
+            disc_state,
+            target_params,
+            c_loss,
+            a_loss,
+            d_loss,
+        ) = jax.lax.cond(
+            should_update,
+            do_updates,
+            skip_updates,
+            update_inputs,
+        )
 
         # 6. Handle episode resets
+        num_done = jnp.sum(dones)
+        new_ep_rewards = state.env_ep_rewards + diayn_rewards
+        new_ep_rewards = new_ep_rewards * (1 - dones)
+
+        key, key_new_skills = jax.random.split(key)
+        new_skills = jax.random.randint(key_new_skills, (num_envs,), 0, n_skills)
+        env_skills = jnp.where(dones, new_skills, state.env_skills)
+
+        new_episode_steps = state.env_episode_steps + 1
+        new_episode_steps = jnp.where(dones, 0, new_episode_steps)
 
         # 7. Build new state and metrics
+        new_state = DIAYNTrainingState(
+            policy_state=policy_state,
+            critic_state=critic_state,
+            disc_state=disc_state,
+            target_critic_params=target_params,
+            replay_buf=new_replay_buf,
+            env_state=next_env_state,
+            obs=next_obs,
+            env_skills=env_skills,
+            env_ep_rewards=new_ep_rewards,
+            env_episode_steps=new_episode_steps,
+            key=key,
+            step=state.step + num_envs,
+            episode_count=state.episode_count + num_done.astype(jnp.int32),
+        )
+
+        metrics = Metrics(
+            critic_loss=c_loss,
+            actor_loss=a_loss,
+            disc_loss=d_loss,
+            avg_step_reward=jnp.mean(diayn_rewards),
+            num_episodes=num_done,
+        )
+
+        return new_state, metrics
+
+    return jax.jit(training_step)
