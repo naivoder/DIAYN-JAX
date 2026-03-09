@@ -1,19 +1,22 @@
-import jax 
+import jax
 import jax.numpy as jnp
 import optax
-import flax.linen as nn 
-from typing import NamedTuple
+import flax.linen as nn
+from flax.training.train_state import TrainState
+from typing import NamedTuple, Any
+
 
 class ReplayBufferState(NamedTuple):
-    obs: jnp.ndarray                # (capacity, obs_dim)
-    action: jnp.ndarray             # (capacity, action_dim)
-    reward: jnp.ndarray             # (capacity,)
-    next_obs: jnp.ndarray           # (capacity, obs_dim)
-    done: jnp.ndarray               # (capacity,)
-    skill: jnp.ndarray              # (capacity,) integer skill index
-    episode_step: jnp.ndarray       # (capacity,) for skipping states
-    size: jnp.ndarray               # scalar - current size of the buffer
-    ptr: jnp.ndarray                # scalar - write pointer
+    obs: jnp.ndarray  # (capacity, obs_dim)
+    action: jnp.ndarray  # (capacity, action_dim)
+    reward: jnp.ndarray  # (capacity,)
+    next_obs: jnp.ndarray  # (capacity, obs_dim)
+    done: jnp.ndarray  # (capacity,)
+    skill: jnp.ndarray  # (capacity,) integer skill index
+    episode_step: jnp.ndarray  # (capacity,) for skipping states
+    size: jnp.ndarray  # scalar - current size of the buffer
+    ptr: jnp.ndarray  # scalar - write pointer
+
 
 def init_replay_buffer(capacity: int, obs_dim: int, act_dim: int) -> ReplayBufferState:
     return ReplayBufferState(
@@ -25,14 +28,17 @@ def init_replay_buffer(capacity: int, obs_dim: int, act_dim: int) -> ReplayBuffe
         skill=jnp.zeros((capacity,), dtype=jnp.int32),
         episode_step=jnp.zeros((capacity,), dtype=jnp.int32),
         size=jnp.array(0, dtype=jnp.int32),
-        ptr=jnp.array(0, dtype=jnp.int32)
+        ptr=jnp.array(0, dtype=jnp.int32),
     )
 
-def buffer_add_batch(buf: ReplayBufferState, obs, action, reward, next_obs, done, skill, episode_step) -> ReplayBufferState:
+
+def buffer_add_batch(
+    buf: ReplayBufferState, obs, action, reward, next_obs, done, skill, episode_step
+) -> ReplayBufferState:
     capacity = buf.obs.shape[0]
     batch_size = obs.shape[0]
 
-    ids = (buf.ptr + jnp.arange(batch_size)) % capacity 
+    ids = (buf.ptr + jnp.arange(batch_size)) % capacity
 
     return ReplayBufferState(
         obs=buf.obs.at[ids].set(obs),
@@ -43,11 +49,12 @@ def buffer_add_batch(buf: ReplayBufferState, obs, action, reward, next_obs, done
         skill=buf.skill.at[ids].set(skill),
         episode_step=buf.episode_step.at[ids].set(episode_step),
         size=jnp.minimum(buf.size + batch_size, capacity),
-        ptr=(buf.ptr + batch_size) % capacity
+        ptr=(buf.ptr + batch_size) % capacity,
     )
 
+
 def buffer_sample(buf: ReplayBufferState, key: jnp.ndarray, batch_size: int):
-    # use jnp.maximum to avoid randint(0, 0) edge case 
+    # use jnp.maximum to avoid randint(0, 0) edge case
     safe_size = jnp.maximum(buf.size, 1)
     ids = jax.random.randint(key, (batch_size,), 0, safe_size)
     return (
@@ -57,11 +64,12 @@ def buffer_sample(buf: ReplayBufferState, key: jnp.ndarray, batch_size: int):
         buf.next_obs[ids],
         buf.done[ids],
         buf.skill[ids],
-        buf.episode_step[ids]
+        buf.episode_step[ids],
     )
 
+
 class QNetwork(nn.Module):
-    hidden_dim: int = 300 
+    hidden_dim: int = 300
 
     @nn.compact
     def __call__(self, obs, skill_onehot, action):
@@ -72,7 +80,8 @@ class QNetwork(nn.Module):
         x = nn.relu(x)
         x = nn.Dense(1)(x)
         return x.squeeze(-1)
-    
+
+
 class TwinQ(nn.Module):
     hidden_dim: int = 300
 
@@ -81,7 +90,8 @@ class TwinQ(nn.Module):
         q1 = QNetwork(self.hidden_dim, name="q1")(obs, skill_onehot, action)
         q2 = QNetwork(self.hidden_dim, name="q2")(obs, skill_onehot, action)
         return q1, q2
-    
+
+
 class GaussianPolicy(nn.Module):
     hidden_dim: int = 300
     action_dim: int = 1
@@ -103,30 +113,39 @@ class GaussianPolicy(nn.Module):
 
         # Reparameterization trick
         noise = jax.random.normal(key, mean.shape)
-        raw_action = mean + std * noise 
+        raw_action = mean + std * noise
 
-        # Clamp raw_action to prevent tanh saturation 
-        # tanh(20) ~ 1.0, log(cosh(20))) ~ 20, so this is a safe range 
+        # Clamp raw_action to prevent tanh saturation
+        # tanh(20) ~ 1.0, log(cosh(20))) ~ 20, so this is a safe range
         # Outside of this there are issues with Jacobian correction
         raw_action = jnp.clip(raw_action, -20.0, 20.0)
         action = jnp.tanh(raw_action)
 
         log_prob = -0.5 * (
-            ((raw_action - mean) / (std + 1e-8)) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi)
+            ((raw_action - mean) / (std + 1e-8)) ** 2
+            + 2 * log_std
+            + jnp.log(2 * jnp.pi)
         )
         log_prob = log_prob.sum(axis=-1)
 
         # Correction for Tanh squashing
-        # log(1 - tanh^2) is unstable for large actions 
-        log_prob -= jnp.sum(2.0 * (
-            jnp.abs(raw_action) + jnp.log(1 + jnp.exp(-2.0 * jnp.abs(raw_action))) - jnp.log(2.0)),
-            axis=-1)
-        
-        return action, log_prob, mean 
-    
+        # log(1 - tanh^2) is unstable for large actions
+        log_prob -= jnp.sum(
+            2.0
+            * (
+                jnp.abs(raw_action)
+                + jnp.log(1 + jnp.exp(-2.0 * jnp.abs(raw_action)))
+                - jnp.log(2.0)
+            ),
+            axis=-1,
+        )
+
+        return action, log_prob, mean
+
+
 class Discriminator(nn.Module):
     hidden_dim: int = 300
-    n_skills: int = 10 
+    n_skills: int = 10
 
     @nn.compact
     def __call__(self, obs):
@@ -136,3 +155,27 @@ class Discriminator(nn.Module):
         x = nn.relu(x)
         logits = nn.Dense(self.n_skills)(x)
         return logits
+
+
+class DIAYNTrainingState(NamedTuple):
+    # Flax TrainState bundles params and opt
+    policy_state: TrainState  # policy state
+    critic_state: TrainState  # critic state
+    disc_state: TrainState  # discriminator state
+    target_critic_params: Any  # slow moving copy of critic
+    replay_buf_state: ReplayBufferState  # replay buffer state
+    env_state: Any  # brax env states
+    obs: jnp.ndarray  # current observations
+    env_skills: jnp.ndarray  # skill assigned to each env
+    env_ep_rewards: jnp.ndarray  # cumulative rewards per env
+    key: jnp.ndarray  # PRNG key
+    step: jnp.ndarray  # global step count
+    episode_count: jnp.ndarray  # total episodes completed
+
+
+class Metrics(NamedTuple):
+    critic_loss: jnp.ndarray
+    actor_loss: jnp.ndarray
+    disc_loss: jnp.ndarray
+    avg_step_reward: jnp.ndarray  # average DIAYN reward per env step
+    num_episodes: jnp.ndarray
