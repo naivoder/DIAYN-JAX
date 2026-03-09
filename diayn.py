@@ -179,3 +179,16 @@ class Metrics(NamedTuple):
     disc_loss: jnp.ndarray
     avg_step_reward: jnp.ndarray  # average DIAYN reward per env step
     num_episodes: jnp.ndarray
+
+
+def compute_diayn_reward(disc_params, discriminator, obs, skill_ids, n_skills):
+    logits = discriminator.apply(disc_params, obs)
+    logits = jnp.clip(logits, -20.0, 20.0)  # prevent extreme values
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+
+    log_qz_s = log_probs[jnp.arange(log_probs.shape[0]), skill_ids]
+    log_pz = -jnp.log(n_skills + 0.0)  # 0.0 to ensure floats
+    reward = log_qz_s - log_pz
+
+    # Clamp reward to prevent q-value divergence
+    return jnp.clip(reward, -10.0, 10.0)
