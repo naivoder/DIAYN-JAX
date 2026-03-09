@@ -5,6 +5,7 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 from typing import NamedTuple, Any, Tuple
 from functools import partial
+import brax
 
 class ReplayBufferState(NamedTuple):
     obs: jnp.ndarray  # (capacity, obs_dim)
@@ -555,3 +556,184 @@ def make_training_step(
         return new_state, metrics
 
     return jax.jit(training_step)
+
+
+def make_full_training(
+    training_step_fn, total_iterations: int, log_every: int, warmup_steps: int
+):
+    def full_training(state: DIAYNTrainingState) -> Tuple[DIAYNTrainingState, Metrics]:
+        def scan_fn(carry, iteration):
+            state, running_metrics = carry
+            new_state, metrics = training_step_fn(state)
+
+            safe_critic = jnp.where(
+                jnp.isnan(metrics.critic_loss), 0.0, metrics.critic_loss
+            )
+            safe_actor = jnp.where(
+                jnp.isnan(metrics.actor_loss), 0.0, metrics.actor_loss
+            )
+            safe_disc = jnp.where(jnp.isnan(metrics.disc_loss), 0.0, metrics.disc_loss)
+            safe_reward = jnp.where(
+                jnp.isnan(metrics.avg_step_reward), 0.0, metrics.avg_step_reward
+            )
+
+            new_running = Metrics(
+                critic_loss=running_metrics.critic_loss + safe_critic,
+                actor_loss=running_metrics.actor_loss + safe_actor,
+                disc_loss=running_metrics.disc_loss + safe_disc,
+                avg_step_reward=running_metrics.avg_step_reward + safe_reward,
+                num_episodes=running_metrics.num_episodes + metrics.num_episodes,
+            )
+
+            def do_log(_):
+                jax.debug.print(
+                    "  Step {step:>7d} | Ep {ep:>4d} | Reward/Step: {reward:>+6.3f} | "
+                    "Disc Loss: {disc:.4f} | Critic Loss: {crit:.4f}",
+                    step=new_state.step,
+                    ep=new_state.episode_count,
+                    reward=metrics.avg_step_reward,
+                    disc=metrics.disc_loss,
+                    crit=metrics.critic_loss,
+                )
+
+            def no_log(_):
+                pass
+
+            should_log = (
+                (new_state.step >= warmup_steps)
+                & (iteration % log_every == 0)
+                & (iteration > 0)
+            )
+            jax.lax.cond(should_log, do_log, no_log, None)
+
+            return (new_state, new_running), metrics
+
+        init_metrics = Metrics(
+            critic_loss=0.0,
+            actor_loss=0.0,
+            disc_loss=0.0,
+            avg_step_reward=0.0,
+            num_episodes=0.0,
+        )
+
+        (final_state, final_running), all_metrics = jax.lax.scan(
+            scan_fn, (state, init_metrics), jnp.arange(total_iterations)
+        )
+
+        aggregated = Metrics(
+            critic_loss=final_running.critic_loss / total_iterations,
+            actor_loss=final_running.actor_loss / total_iterations,
+            disc_loss=final_running.disc_loss / total_iterations,
+            avg_step_reward=final_running.avg_step_reward / total_iterations,
+            num_episodes=final_running.num_episodes,
+        )
+
+        return final_state, aggregated
+
+    return jax.jit(full_training)
+
+
+def make_parallel_eval(
+    env_name: str,
+    policy_net,
+    disc_net,
+    n_skills: int,
+    n_eval_episodes: int,
+    episode_len: int,
+    action_scale: float,
+):
+    total_evals = n_skills * n_eval_episodes
+    eval_env = brax.envs.create(env_name, auto_reset=True, batch_size=total_evals)
+
+    def parallel_eval(policy_params, disc_params, key):
+        skill_ids = jnp.repeat(jnp.arange(n_skills), n_eval_episodes)
+        skill_onehots = jax.nn.one_hot(skill_ids, n_skills)
+
+        key, key_reset = jax.random.split(key)
+        env_state = eval_env.reset(key_reset)
+
+        def step_fn(carry, _):
+            env_state, key, total_rewards, correct_counts = carry
+            key, key_act = jax.random.split(key)
+            obs = env_state.obs
+
+            # Mean for deterministic actions during eval
+            _, _, mean = policy_net.apply(policy_params, obs, skill_onehots, key_act)
+            actions = jnp.tanh(mean) * action_scale
+
+            next_env_state = eval_env.step(env_state, actions)
+            next_obs = next_env_state.obs
+            rewards = next_env_state.reward
+
+            # Check discriminator predictions
+            logits = disc_net.apply(disc_params, next_obs)
+            pred_skills = jnp.argmax(logits, axis=-1)
+            is_correct = (pred_skills == skill_ids).astype(jnp.float32)
+
+            return (
+                next_env_state,
+                key,
+                total_rewards + rewards,
+                correct_counts + is_correct,
+            ), None
+
+        init_carry = (env_state, key, jnp.zeros(total_evals), jnp.zeros(total_evals))
+        (_, _, total_rewards, correct_counts), _ = jax.lax.scan(
+            step_fn, init_carry, None, length=episode_len
+        )
+
+        accuracies = correct_counts / episode_len
+        rewards_per_skill = total_rewards.reshape(n_skills, n_eval_episodes).mean(
+            axis=1
+        )
+        accuracy_per_skill = accuracies.reshape(n_skills, n_eval_episodes).mean(axis=1)
+
+        return rewards_per_skill, accuracy_per_skill
+
+    return jax.jit(parallel_eval)
+
+
+def evaluate_skills(
+    env_name,
+    policy_net,
+    policy_params,
+    disc_net,
+    disc_params,
+    n_skills,
+    key,
+    n_eval_episodes=5,
+    episode_len=1000,
+    action_scale=1.0,
+):
+    parallel_eval_fn = make_parallel_eval(
+        env_name,
+        policy_net,
+        disc_net,
+        n_skills,
+        n_eval_episodes,
+        episode_len,
+        action_scale,
+    )
+
+    rewards_per_skill, accuracy_per_skill = parallel_eval_fn(
+        policy_params, disc_params, key
+    )
+    jax.block_until_ready(rewards_per_skill)
+
+    results = {}
+    for z in range(n_skills):
+        results[z] = {
+            "env_reward": float(rewards_per_skill[z]),
+            "disc_accuracy": float(accuracy_per_skill[z]),
+        }
+        print(
+            f"  Skill {z:>2d}: "
+            f"Env Reward = {results[z]['env_reward']:>8.1f} | "
+            f"Disc Accuracy = {results[z]['disc_accuracy']:.2%}"
+        )
+
+    avg_accuracy = float(accuracy_per_skill.mean())
+    print(f"\n  Overall Discriminator Accuracy: {avg_acc:.2%}")
+    print(f"  (Random baseline: {1/n_skills:.2%})")
+
+    return results
