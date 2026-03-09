@@ -60,3 +60,79 @@ def buffer_sample(buf: ReplayBufferState, key: jnp.ndarray, batch_size: int):
         buf.episode_step[ids]
     )
 
+class QNetwork(nn.Module):
+    hidden_dim: int = 300 
+
+    @nn.compact
+    def __call__(self, obs, skill_onehot, action):
+        x = jnp.concatenate([obs, skill_onehot, action], axis=-1)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dense(1)(x)
+        return x.squeeze(-1)
+    
+class TwinQ(nn.Module):
+    hidden_dim: int = 300
+
+    @nn.compact
+    def __call__(self, obs, skill_onehot, action):
+        q1 = QNetwork(self.hidden_dim, name="q1")(obs, skill_onehot, action)
+        q2 = QNetwork(self.hidden_dim, name="q2")(obs, skill_onehot, action)
+        return q1, q2
+    
+class GaussianPolicy(nn.Module):
+    hidden_dim: int = 300
+    action_dim: int = 1
+    log_std_min: float = -20.0
+    log_std_max: float = 2.0
+
+    @nn.compact
+    def __call__(self, obs, skill_onehot, key):
+        x = jnp.concatenate([obs, skill_onehot], axis=-1)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+
+        mean = nn.Dense(self.action_dim)(x)
+        log_std = nn.Dense(self.action_dim)(x)
+        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+        std = jnp.exp(log_std)
+
+        # Reparameterization trick
+        noise = jax.random.normal(key, mean.shape)
+        raw_action = mean + std * noise 
+
+        # Clamp raw_action to prevent tanh saturation 
+        # tanh(20) ~ 1.0, log(cosh(20))) ~ 20, so this is a safe range 
+        # Outside of this there are issues with Jacobian correction
+        raw_action = jnp.clip(raw_action, -20.0, 20.0)
+        action = jnp.tanh(raw_action)
+
+        log_prob = -0.5 * (
+            ((raw_action - mean) / (std + 1e-8)) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi)
+        )
+        log_prob = log_prob.sum(axis=-1)
+
+        # Correction for Tanh squashing
+        # log(1 - tanh^2) is unstable for large actions 
+        log_prob -= jnp.sum(2.0 * (
+            jnp.abs(raw_action) + jnp.log(1 + jnp.exp(-2.0 * jnp.abs(raw_action))) - jnp.log(2.0)),
+            axis=-1)
+        
+        return action, log_prob, mean 
+    
+class Discriminator(nn.Module):
+    hidden_dim: int = 300
+    n_skills: int = 10 
+
+    @nn.compact
+    def __call__(self, obs):
+        x = nn.Dense(self.hidden_dim)(obs)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        logits = nn.Dense(self.n_skills)(x)
+        return logits
