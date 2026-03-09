@@ -1,0 +1,13 @@
+name: jax
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - "jax[cuda12]"
+      - flax
+      - optax
+      - brax
+      - mujoco-warp
