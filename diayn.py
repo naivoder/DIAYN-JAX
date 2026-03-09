@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
-from typing import NamedTuple, Any
-
+from typing import NamedTuple, Any, Tuple
+from functools import partial
 
 class ReplayBufferState(NamedTuple):
     obs: jnp.ndarray  # (capacity, obs_dim)
@@ -284,3 +284,86 @@ def soft_update(target_params, online_params, tau: float = 0.005):
     return jax.tree.map(
         lambda t, o: tau * o + (1 - tau) * t, target_params, online_params
     )
+
+
+def make_training_step(
+    env,
+    policy_net,
+    critic_net,
+    disc_net,
+    n_skills: int,
+    num_envs: int,
+    batch_size: int,
+    gamma: float,
+    alpha: float,
+    tau: float,
+    action_scale: float,
+    warmup_steps: int,
+    utd_ratio: int = 1,
+    disc_utd_ratio: int = 1,
+    skip_initial_steps: int = 0,
+):
+    compute_reward = partial(
+        compute_diayn_reward, discriminator=disc_net, n_skills=n_skills
+    )
+    do_update_critic = partial(update_critic, gamma=gamma, alpha=alpha)
+    do_update_actor = partial(update_actor, alpha=alpha)
+    do_soft_update = partial(soft_update, tau=tau)
+    do_update_disc = partial(
+        update_discriminator, skip_initial_steps=skip_initial_steps
+    )
+
+    def training_step(state: DIAYNTrainingState) -> Tuple[DIAYNTrainingState, Metrics]:
+        key = state.key
+
+        # 1. Select actions for all envs
+        key, key_act, key_random = jax.random.split(key, 3)
+        skill_onehot = jax.nn.one_hot(state.env_skills, n_skills)
+
+        policy_actions = policy_net.apply(
+            state.policy_state.params, state.obs, skill_onehot, key_act
+        )[0]
+        random_actions = jax.random.uniform(
+            key_random, (num_envs, policy_actions.shape[-1]), minval=-1.0, maxval=1.0
+        )
+
+        # During warmup use random, else use policy
+        actions = jax.lax.cond(
+            state.step < warmup_steps, lambda: random_actions, lambda: policy_actions
+        )
+        env_actions = actions * action_scale
+
+        # 2. Step all envs in parallel
+        next_env_state = env.step(state.env_state, env_actions)
+        next_obs = next_env_state.obs
+        dones = next_env_state.done
+
+        # Sanitize obs to remove potential NaNs
+        next_obs = jnp.nan_to_num(next_obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        next_obs = jnp.clip(next_obs, -1e6, 1e6)
+
+        # 3. Compute DIAYN Rewards
+        diayn_rewards = compute_reward(
+            state.disc_state.params, obs=next_obs, skill_ids=state.env_skills
+        )
+
+        # Zero rewards for terminal transitions
+        diayn_rewards = diayn_rewards * (1.0 - dones)
+
+        # 4. Add transitions to replay buffer
+        new_replay_buf = buffer_add_batch(
+            state.replay_buf,
+            state.obs,
+            actions,
+            diayn_rewards,
+            next_obs,
+            dones.astype(jnp.float32),
+            state.env_skills,
+            state.env_episode_steps,
+        )
+
+        # 5. Update networks after warmup
+
+        # 6. Handle episode resets
+
+        # 7. Build new state and metrics
