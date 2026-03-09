@@ -192,3 +192,95 @@ def compute_diayn_reward(disc_params, discriminator, obs, skill_ids, n_skills):
 
     # Clamp reward to prevent q-value divergence
     return jnp.clip(reward, -10.0, 10.0)
+
+
+def update_critic(
+    critic_state: TrainState,
+    target_critic_params: Any,
+    policy_state: TrainState,
+    obs,
+    action,
+    reward,
+    next_obs,
+    done,
+    skill_onehot,
+    gamma: float,
+    alpha: float,
+    key: jnp.ndarray,
+):
+    next_action, next_log_prob, _ = policy_state.apply_fn(
+        policy_state.params, next_obs, skill_onehot, key
+    )
+    next_q1, next_q2 = critic_state.apply_fn(
+        target_critic_params, next_obs, skill_onehot, next_action
+    )
+    next_q = jnp.minimum(next_q1, next_q2) - alpha * jnp.clip(
+        next_log_prob, -20.0, 20.0
+    )
+    next_q = jnp.clip(next_q, -100.0, 100.0)  # TO DO: test sensitivity to this value
+    target_q = jax.lax.stop_gradient(reward + gamma * (1.0 - done) * next_q)
+
+    def critic_loss_fn(params):
+        q1, q2 = critic_state.apply_fn(params, obs, skill_onehot, action)
+        # Huber loss is more robust to outliers than MSE
+        loss_q1 = jnp.mean(optax.huber_loss(q1, target_q, delta=1.0))
+        loss_q2 = jnp.mean(optax.huber_loss(q2, target_q, delta=1.0))
+        return loss_q1 + loss_q2
+
+    loss, grads = jax.value_and_grad(critic_loss_fn)(critic_state.params)
+    return critic_state.apply_gradients(grads=grads), loss
+
+
+def update_actor(
+    policy_state: TrainState,
+    critic_state: TrainState,
+    obs,
+    skill_onehot,
+    alpha: float,
+    key: jnp.ndarray,
+):
+    def actor_loss_fn(params):
+        action, log_prob, _ = policy_state.apply_fn(params, obs, skill_onehot, key)
+        q1, q2 = critic_state.apply_fn(critic_state.params, obs, skill_onehot, action)
+        q_min = jnp.clip(jnp.minimum(q1, q2), -100, 100)
+        log_prob = jnp.clip(log_prob, -20.0, 20.0)
+        return jnp.mean(alpha * log_prob - q_min)
+
+    loss, grads = jax.value_and_grad(actor_loss_fn)(policy_state.params)
+    return policy_state.apply_gradients(grads=grads), loss
+
+
+def update_discriminator(
+    disc_state: TrainState,
+    obs,
+    skill_ids,
+    mask=None,
+    episode_step=None,
+    skip_initial_steps: int = 0,
+):
+    # Mask terminal states and optional initial steps
+    batch_size = obs.shape[0]
+    combined_mask = jnp.ones(batch_size)
+    if mask is not None:
+        combined_mask = combined_mask * mask
+    if episode_step is not None:
+        step_mask = combined_mask * (episode_step >= skip_initial_steps).astype(
+            jnp.float32
+        )
+        combined_mask = combined_mask * step_mask
+
+    def disc_loss_fn(params):
+        logits = disc_state.apply_fn(params, obs)
+        ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits, skill_ids)
+        masked_loss = ce_loss * combined_mask
+        return jnp.sum(masked_loss) / (jnp.sum(combined_mask) + 1e-8)
+
+    loss, grads = jax.value_and_grad(disc_loss_fn)(disc_state.params)
+    return disc_state.apply_gradients(grads=grads), loss
+
+
+def soft_update(target_params, online_params, tau: float = 0.005):
+    # Polyak averaging for target network update
+    return jax.tree.map(
+        lambda t, o: tau * o + (1 - tau) * t, target_params, online_params
+    )
