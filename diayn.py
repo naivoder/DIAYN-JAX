@@ -733,7 +733,7 @@ def evaluate_skills(
         )
 
     avg_accuracy = float(accuracy_per_skill.mean())
-    print(f"\n  Overall Discriminator Accuracy: {avg_acc:.2%}")
+    print(f"\n  Overall Discriminator Accuracy: {avg_accuracy:.2%}")
     print(f"  (Random baseline: {1/n_skills:.2%})")
 
     return results
