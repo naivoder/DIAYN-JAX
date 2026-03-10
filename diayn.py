@@ -172,6 +172,7 @@ class DIAYNTrainingState(NamedTuple):
     obs: jnp.ndarray  # current observations
     env_skills: jnp.ndarray  # skill assigned to each env
     env_ep_rewards: jnp.ndarray  # cumulative rewards per env
+    env_ep_steps: jnp.ndarray  # current step in each env
     key: jnp.ndarray  # PRNG key
     step: jnp.ndarray  # global step count
     episode_count: jnp.ndarray  # total episodes completed
@@ -356,14 +357,14 @@ def make_training_step(
 
         # 4. Add transitions to replay buffer
         new_replay_buf = buffer_add_batch(
-            state.replay_buf,
+            state.replay_buf_state,
             state.obs,
             actions,
             diayn_rewards,
             next_obs,
             dones.astype(jnp.float32),
             state.env_skills,
-            state.env_episode_steps,
+            state.env_ep_steps,
         )
 
         # 5. Update networks after warmup
@@ -528,7 +529,7 @@ def make_training_step(
         new_skills = jax.random.randint(key_new_skills, (num_envs,), 0, n_skills)
         env_skills = jnp.where(dones, new_skills, state.env_skills)
 
-        new_episode_steps = state.env_episode_steps + 1
+        new_episode_steps = state.env_ep_steps + 1
         new_episode_steps = jnp.where(dones, 0, new_episode_steps)
 
         # 7. Build new state and metrics
@@ -537,12 +538,12 @@ def make_training_step(
             critic_state=critic_state,
             disc_state=disc_state,
             target_critic_params=target_params,
-            replay_buf=new_replay_buf,
+            replay_buf_state=new_replay_buf,
             env_state=next_env_state,
             obs=next_obs,
             env_skills=env_skills,
             env_ep_rewards=new_ep_rewards,
-            env_episode_steps=new_episode_steps,
+            env_ep_steps=new_episode_steps,
             key=key,
             step=state.step + num_envs,
             episode_count=state.episode_count + num_done.astype(jnp.int32),
@@ -843,6 +844,8 @@ def train_diayn(
     dummy_action = jnp.zeros((1, act_dim))
     dummy_key = jax.random.PRNGKey(0)
 
+    print(f"  Compiling networks and training functions...", flush=True)
+
     policy_net = GaussianPolicy(hidden_dim=hidden_dim, action_dim=act_dim)
     policy_state = create_train_state(
         policy_net, key_policy, dummy_obs, dummy_skill, dummy_key, lr=learning_rate
@@ -862,27 +865,6 @@ def train_diayn(
     key, key_reset, key_skills = jax.random.split(key, 3)
     env_state = env.reset(key_reset)
     env_skills = jax.random.randint(key_skills, (num_envs,), 0, n_skills)
-
-    if num_envs > 1:
-        print(f"  Desynchronizing {num_envs} environments...", flush=True)
-        desync_steps = 500
-        key, key_desync = jax.random.split(key)
-
-        def desync_step(carry, _):
-            env_state, rng = carry
-            rng, action_rng = jax.random.split(rng)
-            random_actions = jax.random.uniform(
-                action_rng, (num_envs, act_dim), minval=-1.0, maxval=1.0
-            )
-            next_env_state = env.step(env_state, random_actions)
-            return (next_env_state, rng), None
-
-        (env_state, _), _ = jax.lax.scan(
-            desync_step, (env_state, key_desync), None, length=desync_steps
-        )
-        print(f"  Environments desynchronized after {desync_steps} random steps.")
-
-    print(f"  Compiling training functions...", flush=True)
 
     training_step_fn = make_training_step(
         env=env,
@@ -914,12 +896,12 @@ def train_diayn(
         critic_state=critic_state,
         disc_state=disc_state,
         target_critic_params=target_critic_params,
-        replay_buf=replay_buf,
+        replay_buf_state=replay_buf,
         env_state=env_state,
         obs=env_state.obs,
         env_skills=env_skills,
         env_ep_rewards=jnp.zeros(num_envs),
-        env_episode_steps=jnp.zeros(num_envs, dtype=jnp.int32),
+        env_ep_steps=jnp.zeros(num_envs, dtype=jnp.int32),
         key=key,
         step=jnp.array(0, dtype=jnp.int32),
         episode_count=jnp.array(0, dtype=jnp.int32),
